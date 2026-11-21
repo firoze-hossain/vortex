@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/vortex-core",
+    "crates/vortex-ui",
+    "crates/vortex-app",
+]
+resolver = "2"

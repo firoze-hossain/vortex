@@ -1,0 +1,8 @@
+[package]
+name = "vortex-core"
+version = "0.1.0"
+edition = "2021"
+description = "Vortex Unified BitTorrent Engine & Stream Download Accelerator in Pure Rust"
+license = "MIT OR Apache-2.0"
+
+[dependencies]

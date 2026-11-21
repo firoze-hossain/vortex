@@ -1,0 +1,14 @@
+[package]
+name = "vortex-app"
+version = "0.1.0"
+edition = "2021"
+description = "Vortex Unified BitTorrent Client & Intelligent Stream Accelerator Application"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "vortex"
+path = "src/main.rs"
+
+[dependencies]
+vortex-core = { path = "../vortex-core" }
+vortex-ui = { path = "../vortex-ui" }
