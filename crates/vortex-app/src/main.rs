@@ -789,6 +789,7 @@ fn process_modal_action(
             is_hls,
             referer,
             dest_dir,
+            audio_url,
         } => {
             let cached_thumb = match &view.modal {
                 ActiveModal::AddUrl(st) => match &st.preview_state {
@@ -798,7 +799,17 @@ fn process_modal_action(
                 _ => None,
             };
             let mut eng = engine_arc.lock().unwrap();
-            match eng.start_real_stream(&filename, &url, &resolution, size, threads, is_hls, referer, dest_dir) {
+            match eng.start_real_stream_with_audio(
+                &filename,
+                &url,
+                &resolution,
+                size,
+                threads,
+                is_hls,
+                referer,
+                dest_dir,
+                audio_url,
+            ) {
                 Ok(id) => {
                     if let Some(img) = cached_thumb {
                         view.thumb_cache.insert(id, img);

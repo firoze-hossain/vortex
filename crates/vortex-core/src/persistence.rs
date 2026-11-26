@@ -49,6 +49,8 @@ pub struct SavedStreamRecord {
     pub paused: bool,
     pub completed: bool,
     pub save_path: PathBuf,
+    #[serde(default)]
+    pub audio_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

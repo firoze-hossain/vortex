@@ -51,7 +51,16 @@ impl AddUrlModalState {
                     .qualities
                     .iter()
                     .enumerate()
-                    .max_by_key(|(_, q)| (q.has_audio as u32, !q.is_audio_only as u32, q.resolution.0 * q.resolution.1))
+                    .max_by_key(|(_, q)| {
+                        let not_gated = !q.label.contains("[PO-Token Gated]");
+                        let playable_audio = q.has_audio || q.audio_url.is_some();
+                        (
+                            not_gated as u32,
+                            !q.is_audio_only as u32,
+                            playable_audio as u32,
+                            q.resolution.0 * q.resolution.1,
+                        )
+                    })
                     .map(|(i, _)| i)
                     .unwrap_or(0);
                 self.preview_state = PreviewFetchState::Ready {
@@ -121,6 +130,7 @@ pub enum ModalAction {
         is_hls: bool,
         referer: Option<String>,
         dest_dir: Option<PathBuf>,
+        audio_url: Option<String>,
     },
     StartTorrentOrMagnet {
         input: String,
@@ -281,7 +291,7 @@ pub fn render_add_url_modal(
                     surf_h,
                     info_x,
                     card_r.y + 98,
-                    "PO-Token gated by YouTube (403). Select '360p MP4 [READY]' or install yt-dlp.",
+                    "PO-Token gated (403). Play 1080p in Brave/Chrome/Firefox, or install yt-dlp.",
                     info_w,
                     ACCENT_AMBER,
                 );
@@ -357,8 +367,8 @@ pub fn render_add_url_modal(
                         "GATED"
                     } else if q.is_audio_only {
                         "AUDIO"
-                    } else if q.has_audio {
-                        "READY"
+                    } else if q.has_audio || q.audio_url.is_some() {
+                        "HD+AUD"
                     } else {
                         "VID"
                     };
@@ -548,6 +558,7 @@ pub fn handle_add_url_click(
                         is_hls: q.is_hls,
                         referer: Some(preview.original_url.clone()),
                         dest_dir: state.custom_save_dir.clone(),
+                        audio_url: q.audio_url.clone(),
                     };
                 }
                 // Do NOT download an HTML page (e.g. YouTube watch page) when qualities is empty!
@@ -574,6 +585,7 @@ pub fn handle_add_url_click(
                     threads: state.threads,
                     referer: None,
                     dest_dir: state.custom_save_dir.clone(),
+                    audio_url: None,
                 };
             }
         }

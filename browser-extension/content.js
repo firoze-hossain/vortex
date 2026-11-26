@@ -175,6 +175,7 @@
           quality: s.label,
           url: s.url,
           size: s.size || 0,
+          resHeight: (s.res && s.res[1]) || 0,
           isHls: Boolean(s.isHls),
           isAudioOnly: Boolean(s.isAudioOnly),
           source: "browser",
@@ -213,16 +214,22 @@
           quality: q.label || "Auto",
           url: q.url,
           size: q.estimated_size_bytes || 0,
+          resHeight: (q.resolution && q.resolution[1]) || 0,
           isHls: Boolean(q.is_hls) || q.url.includes(".m3u8"),
           isAudioOnly: Boolean(q.is_audio_only),
+          audioUrl: q.audio_url || null,
           source: "vortex",
           gated
         });
       }
     }
 
-    // Sort: unlocked browser/vortex streams before [PO-Token Gated] adaptive ones
-    options.sort((a, b) => Number(a.gated) - Number(b.gated));
+    // Sort: unlocked highest resolution first, then other unlocked, then [PO-Token Gated]
+    options.sort((a, b) => {
+      if (Number(a.gated) !== Number(b.gated)) return Number(a.gated) - Number(b.gated);
+      if (Number(a.isAudioOnly) !== Number(b.isAudioOnly)) return Number(a.isAudioOnly) - Number(b.isAudioOnly);
+      return (b.resHeight || 0) - (a.resHeight || 0);
+    });
     return options;
   }
 
@@ -241,7 +248,8 @@
       size: opt.size || 0,
       threads: 8,
       isHls: opt.isHls,
-      referer: window.location.href
+      referer: window.location.href,
+      audioUrl: opt.audioUrl || null
     });
 
     if (res.ok && res.data?.ok) {

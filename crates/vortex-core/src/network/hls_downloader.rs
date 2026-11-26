@@ -41,6 +41,7 @@ impl StreamHandle {
             save_path: final_path,
             part_path,
             referer,
+            audio_url: None,
             paused: AtomicBool::new(initial_paused),
             cancelled: AtomicBool::new(false),
             completed: AtomicBool::new(false),

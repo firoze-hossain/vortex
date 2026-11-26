@@ -162,6 +162,7 @@ mod tests {
                     is_audio_only: false,
                     is_hls: true,
                     has_audio: true,
+                    audio_url: None,
                 },
                 MediaStreamQuality {
                     label: "720p HD".into(),
@@ -173,6 +174,7 @@ mod tests {
                     is_audio_only: false,
                     is_hls: true,
                     has_audio: true,
+                    audio_url: None,
                 },
             ],
             note: None,
@@ -182,6 +184,54 @@ mod tests {
         let _ = modals::handle_add_url_click(1080, 760, 600, 380, &mut st);
         if let PreviewFetchState::Ready { selected_quality_idx, .. } = st.preview_state {
             assert_eq!(selected_quality_idx, 1);
+        } else {
+            panic!("Expected Ready state");
+        }
+
+        // Verify companion-audio 1080p MP4 (+Audio) is preferred by default over standalone Audio M4A
+        let mut st2 = AddUrlModalState::default();
+        st2.set_preview_result(Ok(MediaPreview {
+            original_url: "https://www.youtube.com/watch?v=test".into(),
+            kind: PreviewKind::YouTube,
+            title: "Music Video".into(),
+            author: Some("Artist".into()),
+            duration_secs: Some(200),
+            source_domain: "www.youtube.com".into(),
+            content_type: "video/mp4".into(),
+            resumable: true,
+            suggested_filename: "Music_Video.mp4".into(),
+            thumbnail_url: None,
+            thumbnail_bytes: None,
+            qualities: vec![
+                MediaStreamQuality {
+                    label: "1080p MP4 (+Audio)".into(),
+                    resolution: (1920, 1080),
+                    mime_type: "video/mp4".into(),
+                    estimated_size_bytes: 80_000_000,
+                    url: "https://example.com/1080.mp4".into(),
+                    bitrate_kbps: 4000,
+                    is_audio_only: false,
+                    is_hls: false,
+                    has_audio: false,
+                    audio_url: Some("https://example.com/140.m4a".into()),
+                },
+                MediaStreamQuality {
+                    label: "Audio M4A (129 kbps)".into(),
+                    resolution: (0, 0),
+                    mime_type: "audio/m4a".into(),
+                    estimated_size_bytes: 3_500_000,
+                    url: "https://example.com/140.m4a".into(),
+                    bitrate_kbps: 129,
+                    is_audio_only: true,
+                    is_hls: false,
+                    has_audio: true,
+                    audio_url: None,
+                },
+            ],
+            note: None,
+        }));
+        if let PreviewFetchState::Ready { selected_quality_idx, .. } = st2.preview_state {
+            assert_eq!(selected_quality_idx, 0, "Expected 1080p MP4 (+Audio) selected over Audio M4A");
         } else {
             panic!("Expected Ready state");
         }

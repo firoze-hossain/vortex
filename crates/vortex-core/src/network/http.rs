@@ -8,6 +8,9 @@ pub const DEFAULT_USER_AGENT: &str =
 
 pub fn user_agent_for_url(url: &str) -> &'static str {
     if url.contains("googlevideo.com") {
+        if url.contains("c=ANDROID_VR") {
+            return "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+        }
         if url.contains("c=ANDROID") {
             return "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip";
         }
@@ -19,7 +22,8 @@ pub fn user_agent_for_url(url: &str) -> &'static str {
 }
 
 fn should_send_referer(url: &str) -> bool {
-    !(url.contains("googlevideo.com") && (url.contains("c=ANDROID") || url.contains("c=IOS")))
+    !(url.contains("googlevideo.com")
+        && (url.contains("c=ANDROID") || url.contains("c=IOS")))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,7 +205,7 @@ pub fn open_range_stream(
     let ua = user_agent_for_url(url);
     let mut req = minreq::get(url)
         .with_header("User-Agent", ua)
-        .with_timeout(30);
+        .with_timeout(120);
     if let Some((start, end)) = range {
         req = req.with_header("Range", format!("bytes={}-{}", start, end));
     }

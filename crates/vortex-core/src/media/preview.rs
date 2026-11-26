@@ -78,6 +78,7 @@ pub fn fetch_url_preview(raw_url: &str) -> Result<MediaPreview, String> {
                 is_audio_only: false,
                 is_hls: false,
                 has_audio: true,
+                audio_url: None,
             }],
             note: Some(format!("InfoHash: {}", mag.info_hash_hex)),
         });
@@ -175,6 +176,7 @@ pub fn fetch_url_preview(raw_url: &str) -> Result<MediaPreview, String> {
             is_audio_only: false,
             is_hls: false,
             has_audio: true,
+            audio_url: None,
         }],
         note: Some(if accept_ranges {
             "Server supports HTTP Range (multi-thread acceleration enabled)".into()
@@ -209,6 +211,7 @@ fn fetch_hls_preview(url: &str, domain: &str, filename: &str) -> Result<MediaPre
                     is_audio_only: false,
                     is_hls: true,
                     has_audio: true,
+                    audio_url: None,
                 });
             }
         }
@@ -230,6 +233,7 @@ fn fetch_hls_preview(url: &str, domain: &str, filename: &str) -> Result<MediaPre
                 is_audio_only: false,
                 is_hls: true,
                 has_audio: true,
+                audio_url: None,
             });
         }
     }
@@ -351,13 +355,6 @@ fn fetch_youtube_preview(url: &str, domain: &str) -> Result<MediaPreview, String
         let attempts = [
             (
                 "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-                android_body,
-                "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
-                "3",
-                "20.10.38",
-            ),
-            (
-                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
                 ios_body,
                 "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X;)",
                 "5",
@@ -369,6 +366,13 @@ fn fetch_youtube_preview(url: &str, domain: &str) -> Result<MediaPreview, String
                 "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
                 "28",
                 "1.61.48",
+            ),
+            (
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                android_body,
+                "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
+                "3",
+                "20.10.38",
             ),
         ];
 
@@ -392,9 +396,12 @@ fn fetch_youtube_preview(url: &str, domain: &str) -> Result<MediaPreview, String
                             &mut duration_secs,
                             &mut qualities,
                         );
-                        // Stop once we have both muxed (has_audio) video AND adaptive formats
+                        // Stop early only once we already have an unlocked HD (720p+) muxed/HLS stream
+                        let has_hd_hls = qualities
+                            .iter()
+                            .any(|q| q.is_hls && q.has_audio && q.resolution.1 >= 720);
                         let has_muxed = qualities.iter().any(|q| !q.is_audio_only && q.has_audio);
-                        if !qualities.is_empty() && has_muxed {
+                        if has_hd_hls && has_muxed {
                             break;
                         }
                     }
@@ -404,6 +411,18 @@ fn fetch_youtube_preview(url: &str, domain: &str) -> Result<MediaPreview, String
                 }
             }
         }
+    }
+
+    // 2B. Merge any live browser-authenticated HD/4K streams captured by Chrome/Brave/Edge/Firefox
+    let mut browser_unlocked_hd = false;
+    for mut bq in crate::media::sniffer::browser_streams_for_url(url) {
+        if !bq.label.contains("[Browser Auth]") {
+            bq.label = format!("{} [Browser Auth]", bq.label);
+        }
+        if !bq.is_audio_only && bq.resolution.1 >= 720 {
+            browser_unlocked_hd = true;
+        }
+        qualities.push(bq);
     }
 
     // 3. Fallback to watch page HTML if Innertube yielded nothing
@@ -428,22 +447,29 @@ fn fetch_youtube_preview(url: &str, domain: &str) -> Result<MediaPreview, String
         }
     }
 
-    // Sort & deduplicate qualities cleanly (360p Direct Ready, 1080p..144p, Audio)
+    // Sort & deduplicate qualities cleanly (Browser Auth & Unlocked Muxed/HLS first, then 2160p..144p, Audio)
+    let raw_before_dedup = qualities.clone();
     qualities = finalize_youtube_qualities(qualities);
 
-    // Quick tail-byte verification on one adaptive stream to detect YouTube PO-Token gating accurately
+    // Quick tail-byte verification on standalone Innertube adaptive streams (ignore HLS & [Browser Auth])
     let mut adaptive_gated = false;
-    if let Some(sample_adapt) = qualities.iter().find(|q| !q.has_audio && q.estimated_size_bytes > 2_000_000) {
+    if let Some(sample_adapt) = qualities
+        .iter()
+        .find(|q| !q.is_hls && !q.has_audio && !q.label.contains("[Browser Auth]") && q.estimated_size_bytes > 2_000_000)
+    {
         if !check_tail_byte_accessible(&sample_adapt.url, sample_adapt.estimated_size_bytes) {
             adaptive_gated = true;
         }
     }
     if adaptive_gated {
         for q in &mut qualities {
-            if !q.has_audio || q.is_audio_only {
+            let is_browser = q.label.contains("[Browser Auth]");
+            if !is_browser && !q.is_hls && (!q.has_audio || q.is_audio_only) {
                 q.label = format!("{} [PO-Token Gated]", q.label.split(" (").next().unwrap_or(&q.label));
             }
         }
+    } else {
+        attach_companion_audio_urls(&mut qualities, &raw_before_dedup);
     }
 
     // 4. Fetch real thumbnail bytes
@@ -451,13 +477,24 @@ fn fetch_youtube_preview(url: &str, domain: &str) -> Result<MediaPreview, String
         .as_deref()
         .and_then(|u| get_bytes(u, Some("https://www.youtube.com/"), 2 * 1024 * 1024).ok());
 
+    let has_unlocked_hd = browser_unlocked_hd
+        || qualities
+            .iter()
+            .any(|q| !q.is_audio_only && q.resolution.1 >= 720 && !q.label.contains("[PO-Token Gated]"));
+
     let note = if qualities.is_empty() {
         Some(format!(
-            "Could not extract unciphered streams ({}). Install yt-dlp or send stream from Aero Browser.",
+            "Could not extract unciphered streams ({}). Install yt-dlp or play in Brave/Chrome with Vortex extension.",
             last_err.unwrap_or_else(|| "ciphered/restricted".into())
         ))
+    } else if has_unlocked_hd {
+        Some(format!(
+            "HD Ready: {} quality option(s) unlocked (up to {}p)",
+            qualities.len(),
+            qualities.iter().map(|q| q.resolution.1).max().unwrap_or(720)
+        ))
     } else if adaptive_gated {
-        Some("360p MP4 (Direct Full) is ready! HD adaptive streams require PO-Token (install yt-dlp or Aero Browser Bridge).".into())
+        Some("360p MP4 Ready! Play at 1080p in Brave/Chrome/Firefox (extension) or install yt-dlp to unlock 1080p/4K.".into())
     } else {
         Some(format!(
             "Ready: {} downloadable quality option(s) extracted",
@@ -546,6 +583,7 @@ pub fn extract_youtube_player_json(
                         is_audio_only: false,
                         is_hls: true,
                         has_audio: true,
+                        audio_url: None,
                     });
                 }
             }
@@ -606,6 +644,7 @@ pub fn extract_youtube_player_json(
                     is_audio_only: is_audio,
                     is_hls: false,
                     has_audio,
+                    audio_url: None,
                 });
             }
         }
@@ -622,11 +661,13 @@ fn finalize_youtube_qualities(mut raw: Vec<MediaStreamQuality>) -> Vec<MediaStre
 
     raw.retain(|q| q.is_audio_only || q.has_audio || !muxed_heights.contains(&q.resolution.1));
 
-    // Sort descending: muxed videos highest->lowest resolution, then MP4 over WebM, then audio-only
+    // Sort descending: non-audio first, [Browser Auth] first, highest resolution/audio next, MP4 over WebM
     raw.sort_by_key(|q| {
+        let is_browser = q.label.contains("[Browser Auth]") as u8;
         let is_mp4 = q.mime_type.contains("mp4") as u8;
         std::cmp::Reverse((
             !q.is_audio_only as u8,
+            is_browser,
             q.has_audio as u8,
             q.resolution.1,
             is_mp4,
@@ -652,6 +693,35 @@ fn finalize_youtube_qualities(mut raw: Vec<MediaStreamQuality>) -> Vec<MediaStre
         }
     }
     out
+}
+
+fn attach_companion_audio_urls(qualities: &mut [MediaStreamQuality], pool: &[MediaStreamQuality]) {
+    let best_m4a = pool
+        .iter()
+        .chain(qualities.iter())
+        .filter(|q| {
+            q.is_audio_only
+                && !q.is_hls
+                && !q.label.contains("[PO-Token Gated]")
+                && (q.mime_type.contains("m4a") || q.mime_type.contains("mp4"))
+        })
+        .max_by_key(|q| q.bitrate_kbps)
+        .map(|q| q.url.clone());
+
+    let Some(aud_url) = best_m4a else {
+        return;
+    };
+
+    for q in qualities.iter_mut() {
+        if !q.is_audio_only && !q.is_hls && !q.has_audio && q.mime_type.contains("mp4") {
+            q.audio_url = Some(aud_url.clone());
+            if q.label.contains("(Video)") {
+                q.label = q.label.replace("(Video)", "(+Audio)");
+            } else if q.label.contains("(HD Video)") {
+                q.label = q.label.replace("(HD Video)", "(+Audio)");
+            }
+        }
+    }
 }
 
 fn build_youtube_filename(title: &str, video_id: Option<&str>) -> String {
@@ -685,6 +755,17 @@ fn check_tail_byte_accessible(url: &str, total_len: u64) -> bool {
         Ok(resp) => (200..300).contains(&resp.status_code),
         Err(_) => false,
     }
+}
+
+fn is_supported_baseline_thumb(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return true;
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        // Baseline JPEG uses SOF0 (0xFF 0xC0); progressive JPEG uses SOF2 (0xFF 0xC2)
+        return bytes.windows(2).any(|w| w == [0xFF, 0xC0]);
+    }
+    false
 }
 
 fn has_ascii_alnum(s: &str) -> bool {
@@ -767,6 +848,7 @@ fn parse_html_video_preview(page_url: &str, domain: &str, html: &str) -> Result<
             is_audio_only: false,
             is_hls,
             has_audio: true,
+            audio_url: None,
         });
     }
 
@@ -795,12 +877,46 @@ fn parse_html_video_preview(page_url: &str, domain: &str, html: &str) -> Result<
 }
 
 fn try_yt_dlp_preview(url: &str, domain: &str) -> Option<MediaPreview> {
+    let mut cmds: Vec<(String, Vec<String>)> = Vec::new();
+    let has_node = Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let mut ytdlp_args = vec![
+        "-J".to_string(),
+        "--no-playlist".to_string(),
+        "--no-warnings".to_string(),
+    ];
+    if has_node {
+        ytdlp_args.push("--js-runtimes".to_string());
+        ytdlp_args.push("node".to_string());
+    }
+    ytdlp_args.push(url.to_string());
+
+    for bin in [
+        "yt-dlp",
+        "/opt/homebrew/bin/yt-dlp",
+        "/usr/local/bin/yt-dlp",
+    ] {
+        cmds.push((bin.to_string(), ytdlp_args.clone()));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        cmds.push((format!("{}/.local/bin/yt-dlp", home), ytdlp_args.clone()));
+        cmds.push((format!("{}/.local/share/uv/tools/yt-dlp/bin/yt-dlp", home), ytdlp_args.clone()));
+        cmds.push((format!("{}/.cargo/bin/yt-dlp", home), ytdlp_args.clone()));
+        let mut uv_args = vec!["tool".to_string(), "run".to_string(), "yt-dlp".to_string()];
+        uv_args.extend(ytdlp_args.clone());
+        cmds.push((format!("{}/.local/bin/uv", home), uv_args.clone()));
+        cmds.push(("uv".to_string(), uv_args));
+    } else {
+        let mut uv_args = vec!["tool".to_string(), "run".to_string(), "yt-dlp".to_string()];
+        uv_args.extend(ytdlp_args);
+        cmds.push(("uv".to_string(), uv_args));
+    }
+
     let mut output_opt = None;
-    for bin in ["yt-dlp", "/opt/homebrew/bin/yt-dlp", "/usr/local/bin/yt-dlp"] {
-        if let Ok(out) = Command::new(bin)
-            .args(["-J", "--no-playlist", "--no-warnings", url])
-            .output()
-        {
+    for (bin, args) in &cmds {
+        if let Ok(out) = Command::new(bin).args(args).output() {
             if out.status.success() {
                 output_opt = Some(out);
                 break;
@@ -812,14 +928,53 @@ fn try_yt_dlp_preview(url: &str, domain: &str) -> Option<MediaPreview> {
     let title = val.get("title").and_then(|v| v.as_str()).unwrap_or("Video").to_string();
     let author = val.get("uploader").and_then(|v| v.as_str()).map(|s| s.to_string());
     let duration_secs = val.get("duration").and_then(|v| v.as_f64()).map(|d| d as u64);
-    let thumb_url = val.get("thumbnail").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let thumbnail_bytes = thumb_url
-        .as_deref()
-        .and_then(|u| get_bytes(u, Some(url), 2 * 1024 * 1024).ok());
+    let mut thumb_candidates: Vec<String> = Vec::new();
+    if let Some(vid) = extract_youtube_id(url) {
+        // `hqdefault.jpg` is Baseline JPEG (supported by pure-Rust baseline JPEG decoder);
+        // `yt-dlp`'s top `thumbnail` on YouTube defaults to `.webp` or progressive `maxresdefault.jpg`.
+        thumb_candidates.push(format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", vid));
+    }
+    if let Some(arr) = val.get("thumbnails").and_then(|v| v.as_array()) {
+        for item in arr.iter().rev() {
+            if let Some(u) = item.get("url").and_then(|v| v.as_str()) {
+                let low = u.to_ascii_lowercase();
+                if (low.contains(".jpg") || low.contains(".jpeg") || low.contains(".png")) && !low.contains(".webp") {
+                    if !thumb_candidates.iter().any(|c| c == u) {
+                        thumb_candidates.push(u.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(top) = val.get("thumbnail").and_then(|v| v.as_str()) {
+        let low = top.to_ascii_lowercase();
+        if !low.contains(".webp") && !thumb_candidates.iter().any(|c| c == top) {
+            thumb_candidates.push(top.to_string());
+        }
+    }
+
+    let mut thumb_url = thumb_candidates.first().cloned();
+    let mut thumbnail_bytes = None;
+    for cand in &thumb_candidates {
+        if let Ok(bytes) = get_bytes(cand, Some(url), 2 * 1024 * 1024) {
+            if is_supported_baseline_thumb(&bytes) {
+                thumb_url = Some(cand.clone());
+                thumbnail_bytes = Some(bytes);
+                break;
+            }
+        }
+    }
 
     let mut qualities = Vec::new();
+    for mut bq in crate::media::sniffer::browser_streams_for_url(url) {
+        if !bq.label.contains("[Browser Auth]") {
+            bq.label = format!("{} [Browser Auth]", bq.label);
+        }
+        qualities.push(bq);
+    }
+
     if let Some(formats) = val.get("formats").and_then(|v| v.as_array()) {
-        for fmt in formats.iter().rev() {
+        for fmt in formats {
             let Some(u) = fmt.get("url").and_then(|v| v.as_str()) else {
                 continue;
             };
@@ -827,8 +982,15 @@ fn try_yt_dlp_preview(url: &str, domain: &str) -> Option<MediaPreview> {
                 continue;
             }
             let ext = fmt.get("ext").and_then(|v| v.as_str()).unwrap_or("mp4");
+            // Skip storyboard sprite images (`mhtml`)
+            if ext == "mhtml" {
+                continue;
+            }
             let vcodec = fmt.get("vcodec").and_then(|v| v.as_str()).unwrap_or("none");
             let acodec = fmt.get("acodec").and_then(|v| v.as_str()).unwrap_or("none");
+            if vcodec == "none" && acodec == "none" {
+                continue;
+            }
             let is_audio = vcodec == "none" && acodec != "none";
             let has_audio = acodec != "none";
             let w = fmt.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -842,12 +1004,14 @@ fn try_yt_dlp_preview(url: &str, domain: &str) -> Option<MediaPreview> {
             let proto = fmt.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
             let is_hls = proto.contains("m3u8") || u.contains(".m3u8");
 
+            let codec_bonus_kbps = if vcodec.starts_with("avc") { tbr + 50_000 } else { tbr };
+
             let label = if is_audio {
-                format!("Audio {} ({}kbps)", ext.to_uppercase(), tbr)
+                format!("Audio {} ({} kbps)", ext.to_uppercase(), tbr)
             } else if h > 0 && has_audio {
-                format!("{}p {}", h, ext.to_uppercase())
+                format!("{}p {} (Full)", h, ext.to_uppercase())
             } else if h > 0 {
-                format!("{}p {} (video)", h, ext.to_uppercase())
+                format!("{}p {} (Video)", h, ext.to_uppercase())
             } else {
                 format!("Stream {}", ext.to_uppercase())
             };
@@ -858,22 +1022,25 @@ fn try_yt_dlp_preview(url: &str, domain: &str) -> Option<MediaPreview> {
                 mime_type: format!("{}/{}", if is_audio { "audio" } else { "video" }, ext),
                 estimated_size_bytes: size,
                 url: u.to_string(),
-                bitrate_kbps: tbr,
+                bitrate_kbps: codec_bonus_kbps,
                 is_audio_only: is_audio,
                 is_hls,
                 has_audio,
+                audio_url: None,
             });
-            if qualities.len() >= 10 {
-                break;
-            }
         }
     }
+
+    let raw_before_dedup = qualities.clone();
+    qualities = finalize_youtube_qualities(qualities);
+    attach_companion_audio_urls(&mut qualities, &raw_before_dedup);
 
     if qualities.is_empty() {
         return None;
     }
 
     let clean_title = sanitize_filename(&title);
+    let max_h = qualities.iter().map(|q| q.resolution.1).max().unwrap_or(720);
     Some(MediaPreview {
         original_url: url.to_string(),
         kind: if is_youtube_url(url) {
@@ -891,7 +1058,7 @@ fn try_yt_dlp_preview(url: &str, domain: &str) -> Option<MediaPreview> {
         thumbnail_url: thumb_url,
         thumbnail_bytes,
         qualities,
-        note: Some("Extracted live streams via yt-dlp".into()),
+        note: Some(format!("Unlocked all resolutions (up to {}p)!", max_h)),
     })
 }
 

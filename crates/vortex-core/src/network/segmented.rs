@@ -185,6 +185,7 @@ pub(crate) struct SharedStream {
     pub save_path: PathBuf,
     pub part_path: PathBuf,
     pub referer: Option<String>,
+    pub audio_url: Option<String>,
     pub paused: AtomicBool,
     pub cancelled: AtomicBool,
     pub completed: AtomicBool,
@@ -209,6 +210,33 @@ impl StreamHandle {
         download_limit_bps: Arc<AtomicU64>,
         initial_paused: bool,
     ) -> Result<Self, String> {
+        Self::start_http_with_audio(
+            id,
+            url,
+            filename,
+            known_size,
+            num_threads,
+            save_dir,
+            referer,
+            None,
+            download_limit_bps,
+            initial_paused,
+        )
+    }
+
+    /// Starts an HTTP/HTTPS segmented download and optionally muxes companion audio (for DASH 1080p/4K MP4s).
+    pub fn start_http_with_audio(
+        id: u64,
+        url: String,
+        filename: String,
+        known_size: u64,
+        num_threads: usize,
+        save_dir: PathBuf,
+        referer: Option<String>,
+        audio_url: Option<String>,
+        download_limit_bps: Arc<AtomicU64>,
+        initial_paused: bool,
+    ) -> Result<Self, String> {
         fs::create_dir_all(&save_dir).map_err(|e| format!("Cannot create download dir: {}", e))?;
 
         let final_path = unique_or_existing_path(&save_dir, &filename);
@@ -220,6 +248,7 @@ impl StreamHandle {
             save_path: final_path,
             part_path,
             referer,
+            audio_url,
             paused: AtomicBool::new(initial_paused),
             cancelled: AtomicBool::new(false),
             completed: AtomicBool::new(false),
@@ -254,9 +283,10 @@ impl StreamHandle {
         let paused = self.shared.paused.load(Ordering::Relaxed);
         let done = self.shared.completed.load(Ordering::Relaxed);
 
+        let has_mux_audio = self.shared.audio_url.is_some();
         let status = if err.is_some() {
             TaskStatus::Error
-        } else if done || seg.is_all_complete() {
+        } else if done || (!has_mux_audio && seg.is_all_complete()) {
             TaskStatus::Completed
         } else if paused {
             TaskStatus::Paused
@@ -390,6 +420,25 @@ fn run_http_download(shared: Arc<SharedStream>, requested_threads: usize) {
 
         let all_done = shared.segmented.lock().unwrap().is_all_complete();
         if all_done {
+            if let Some(ref aud_url) = shared.audio_url {
+                let aud_path = PathBuf::from(format!("{}.vortexaudio", shared.save_path.display()));
+                let aud_ok = download_companion_audio(aud_url, shared.referer.as_deref(), &aud_path);
+                if aud_ok.is_ok()
+                    && crate::media::mp4_mux::mux_video_and_audio(
+                        &shared.part_path,
+                        &aud_path,
+                        &shared.save_path,
+                    )
+                    .is_ok()
+                {
+                    let _ = fs::remove_file(&shared.part_path);
+                    let _ = fs::remove_file(&aud_path);
+                    shared.completed.store(true, Ordering::Relaxed);
+                    return;
+                }
+                let _ = fs::remove_file(&aud_path);
+            }
+
             if let Err(e) = fs::rename(&shared.part_path, &shared.save_path) {
                 *shared.failed.lock().unwrap() = Some(format!("Failed to finalize file: {}", e));
             } else {
@@ -416,35 +465,15 @@ fn run_http_download(shared: Arc<SharedStream>, requested_threads: usize) {
     }
 }
 
+const MAX_RANGE_SLICE_BYTES: u64 = 4 * 1024 * 1024; // 4 MB per HTTP request prevents long-transfer timeouts on 4K/8K files
+const MAX_CHUNK_RETRIES: u32 = 6;
+
 fn download_single_chunk(shared: Arc<SharedStream>, chunk_id: usize, url: &str, use_range: bool) {
-    let (start_byte, end_byte, already_dl) = {
+    let (start_byte, end_byte) = {
         let mut seg = shared.segmented.lock().unwrap();
         let c = &mut seg.chunks[chunk_id];
         c.status = ChunkStatus::Connecting;
-        (c.start_byte, c.end_byte, c.downloaded_bytes)
-    };
-
-    let req_start = start_byte + already_dl;
-    let range_arg = if use_range {
-        if req_start > end_byte {
-            let mut seg = shared.segmented.lock().unwrap();
-            seg.chunks[chunk_id].status = ChunkStatus::Completed;
-            return;
-        }
-        Some((req_start, end_byte))
-    } else {
-        None
-    };
-
-    let mut resp = match open_range_stream(url, range_arg, shared.referer.as_deref()) {
-        Ok(r) => r,
-        Err(e) => {
-            let mut seg = shared.segmented.lock().unwrap();
-            seg.chunks[chunk_id].status = ChunkStatus::Failed;
-            seg.chunks[chunk_id].speed_bps = 0;
-            *shared.failed.lock().unwrap() = Some(e);
-            return;
-        }
+        (c.start_byte, c.end_byte)
     };
 
     let mut file = match OpenOptions::new().write(true).open(&shared.part_path) {
@@ -457,16 +486,7 @@ fn download_single_chunk(shared: Arc<SharedStream>, chunk_id: usize, url: &str, 
         }
     };
 
-    let mut file_offset = if use_range { req_start } else { 0 };
-    if file.seek(SeekFrom::Start(file_offset)).is_err() {
-        return;
-    }
-
-    {
-        let mut seg = shared.segmented.lock().unwrap();
-        seg.chunks[chunk_id].status = ChunkStatus::Downloading;
-    }
-
+    let mut retries = 0u32;
     let mut buf = [0u8; 32 * 1024];
     let mut win_bytes = 0u64;
     let mut win_start = Instant::now();
@@ -479,77 +499,246 @@ fn download_single_chunk(shared: Arc<SharedStream>, chunk_id: usize, url: &str, 
             return;
         }
 
-        match resp.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let mut write_len = n;
-                if use_range {
-                    let max_left = (end_byte + 1).saturating_sub(file_offset) as usize;
-                    write_len = write_len.min(max_left);
-                }
-                if write_len == 0 {
-                    break;
-                }
+        let already_dl = shared.segmented.lock().unwrap().chunks[chunk_id].downloaded_bytes;
+        let req_start = start_byte + already_dl;
 
-                if file.write_all(&buf[..write_len]).is_err() {
-                    let mut seg = shared.segmented.lock().unwrap();
-                    seg.chunks[chunk_id].status = ChunkStatus::Failed;
-                    return;
-                }
-                file_offset += write_len as u64;
-                win_bytes += write_len as u64;
-                total_written_unknown += write_len as u64;
+        if use_range && req_start > end_byte {
+            let mut seg = shared.segmented.lock().unwrap();
+            seg.chunks[chunk_id].status = ChunkStatus::Completed;
+            seg.chunks[chunk_id].speed_bps = 0;
+            return;
+        }
 
-                let elapsed = win_start.elapsed().as_secs_f64();
-                let speed = if elapsed >= 0.25 {
-                    let s = ((win_bytes as f64) / elapsed) as u64;
-                    win_bytes = 0;
-                    win_start = Instant::now();
-                    Some(s)
-                } else {
-                    None
-                };
+        let slice_end = if use_range {
+            (req_start + MAX_RANGE_SLICE_BYTES - 1).min(end_byte)
+        } else {
+            end_byte
+        };
+        let range_arg = if use_range {
+            Some((req_start, slice_end))
+        } else {
+            None
+        };
 
-                {
-                    let mut seg = shared.segmented.lock().unwrap();
-                    if !use_range && seg.total_size == 0 {
-                        seg.chunks[chunk_id].end_byte = total_written_unknown.saturating_sub(1);
-                    }
-                    let c = &mut seg.chunks[chunk_id];
-                    c.downloaded_bytes += write_len as u64;
-                    if let Some(s) = speed {
-                        c.speed_bps = s;
-                    }
-                }
-
-                // Respect global download speed cap if configured
-                let cap = shared.download_limit_bps.load(Ordering::Relaxed);
-                if cap > 0 {
-                    let num_chunks = shared.segmented.lock().unwrap().num_chunks.max(1) as u64;
-                    let per_chunk_cap = (cap / num_chunks).max(4096);
-                    let cur_speed = shared.segmented.lock().unwrap().chunks[chunk_id].speed_bps;
-                    if cur_speed > per_chunk_cap {
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                }
-            }
+        let mut resp = match open_range_stream(url, range_arg, shared.referer.as_deref()) {
+            Ok(r) => r,
             Err(e) => {
+                retries += 1;
+                if retries <= MAX_CHUNK_RETRIES && !e.contains("403") {
+                    thread::sleep(Duration::from_millis((400 * retries as u64).min(3000)));
+                    continue;
+                }
                 let mut seg = shared.segmented.lock().unwrap();
                 seg.chunks[chunk_id].status = ChunkStatus::Failed;
                 seg.chunks[chunk_id].speed_bps = 0;
-                *shared.failed.lock().unwrap() = Some(format!("Read error: {}", e));
+                *shared.failed.lock().unwrap() = Some(e);
                 return;
             }
+        };
+
+        let mut file_offset = if use_range { req_start } else { total_written_unknown };
+        if file.seek(SeekFrom::Start(file_offset)).is_err() {
+            let mut seg = shared.segmented.lock().unwrap();
+            seg.chunks[chunk_id].status = ChunkStatus::Failed;
+            *shared.failed.lock().unwrap() = Some("Disk seek error".into());
+            return;
+        }
+
+        {
+            let mut seg = shared.segmented.lock().unwrap();
+            seg.chunks[chunk_id].status = ChunkStatus::Downloading;
+        }
+
+        let mut slice_failed: Option<String> = None;
+        let mut slice_read_any = false;
+
+        loop {
+            if shared.cancelled.load(Ordering::Relaxed) || shared.paused.load(Ordering::Relaxed) {
+                let mut seg = shared.segmented.lock().unwrap();
+                seg.chunks[chunk_id].speed_bps = 0;
+                return;
+            }
+
+            match resp.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    slice_read_any = true;
+                    retries = 0; // Reset consecutive retry count on healthy progress
+                    let mut write_len = n;
+                    if use_range {
+                        let max_left = (slice_end + 1).saturating_sub(file_offset) as usize;
+                        write_len = write_len.min(max_left);
+                    }
+                    if write_len == 0 {
+                        break;
+                    }
+
+                    if file.write_all(&buf[..write_len]).is_err() {
+                        let mut seg = shared.segmented.lock().unwrap();
+                        seg.chunks[chunk_id].status = ChunkStatus::Failed;
+                        *shared.failed.lock().unwrap() = Some("Disk write error".into());
+                        return;
+                    }
+                    file_offset += write_len as u64;
+                    win_bytes += write_len as u64;
+                    total_written_unknown += write_len as u64;
+
+                    let elapsed = win_start.elapsed().as_secs_f64();
+                    let speed = if elapsed >= 0.25 {
+                        let s = ((win_bytes as f64) / elapsed) as u64;
+                        win_bytes = 0;
+                        win_start = Instant::now();
+                        Some(s)
+                    } else {
+                        None
+                    };
+
+                    {
+                        let mut seg = shared.segmented.lock().unwrap();
+                        if !use_range && seg.total_size == 0 {
+                            seg.chunks[chunk_id].end_byte = total_written_unknown.saturating_sub(1);
+                        }
+                        let c = &mut seg.chunks[chunk_id];
+                        c.downloaded_bytes += write_len as u64;
+                        if let Some(s) = speed {
+                            c.speed_bps = s;
+                        }
+                    }
+
+                    // Respect global download speed cap if configured
+                    let cap = shared.download_limit_bps.load(Ordering::Relaxed);
+                    if cap > 0 {
+                        let num_chunks = shared.segmented.lock().unwrap().num_chunks.max(1) as u64;
+                        let per_chunk_cap = (cap / num_chunks).max(4096);
+                        let cur_speed = shared.segmented.lock().unwrap().chunks[chunk_id].speed_bps;
+                        if cur_speed > per_chunk_cap {
+                            thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                }
+                Err(e) => {
+                    slice_failed = Some(format!("Read error: {}", e));
+                    break;
+                }
+            }
+        }
+
+        if let Some(err_msg) = slice_failed {
+            retries += 1;
+            if use_range && retries <= MAX_CHUNK_RETRIES {
+                thread::sleep(Duration::from_millis((400 * retries as u64).min(3000)));
+                continue;
+            }
+            if !use_range && !slice_read_any && retries <= 3 {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            let mut seg = shared.segmented.lock().unwrap();
+            seg.chunks[chunk_id].status = ChunkStatus::Failed;
+            seg.chunks[chunk_id].speed_bps = 0;
+            *shared.failed.lock().unwrap() = Some(err_msg);
+            return;
+        }
+
+        // For non-range streams, EOF marks complete; for ranged streams, continue to next 4MB slice until end_byte
+        if !use_range {
+            let mut seg = shared.segmented.lock().unwrap();
+            if seg.total_size == 0 {
+                seg.total_size = total_written_unknown;
+                seg.chunks[chunk_id].end_byte = total_written_unknown.saturating_sub(1);
+            }
+            seg.chunks[chunk_id].status = ChunkStatus::Completed;
+            seg.chunks[chunk_id].speed_bps = 0;
+            return;
+        }
+
+        // Guard against premature server EOF before slice_end was actually filled
+        if file_offset <= slice_end {
+            retries += 1;
+            if retries <= MAX_CHUNK_RETRIES {
+                thread::sleep(Duration::from_millis((300 * retries as u64).min(2000)));
+                continue;
+            }
+            let mut seg = shared.segmented.lock().unwrap();
+            seg.chunks[chunk_id].status = ChunkStatus::Failed;
+            seg.chunks[chunk_id].speed_bps = 0;
+            *shared.failed.lock().unwrap() = Some("Connection closed prematurely before chunk finished".into());
+            return;
         }
     }
+}
 
-    let mut seg = shared.segmented.lock().unwrap();
-    if !use_range && seg.total_size == 0 {
-        seg.total_size = total_written_unknown;
-        seg.chunks[chunk_id].end_byte = total_written_unknown.saturating_sub(1);
+fn download_companion_audio(url: &str, referer: Option<&str>, out_path: &PathBuf) -> Result<(), String> {
+    let mut out_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(out_path)
+        .map_err(|e| format!("Audio create error: {}", e))?;
+
+    let mut offset = 0u64;
+    let mut retries = 0u32;
+    let mut buf = [0u8; 32 * 1024];
+
+    // Download audio in 4MB ranged slices if supported cleanly
+    let total_opt = crate::network::http::probe_url(url, referer)
+        .ok()
+        .and_then(|p| if p.accept_ranges { p.content_length } else { None });
+
+    if let Some(total) = total_opt {
+        while offset < total {
+            let slice_end = (offset + MAX_RANGE_SLICE_BYTES - 1).min(total.saturating_sub(1));
+            match open_range_stream(url, Some((offset, slice_end)), referer) {
+                Ok(mut resp) => {
+                    let mut slice_err = false;
+                    while offset <= slice_end {
+                        match resp.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let take = n.min((slice_end + 1 - offset) as usize);
+                                out_file
+                                    .write_all(&buf[..take])
+                                    .map_err(|e| format!("Audio write error: {}", e))?;
+                                offset += take as u64;
+                                retries = 0;
+                            }
+                            Err(_) => {
+                                slice_err = true;
+                                break;
+                            }
+                        }
+                    }
+                    if slice_err && offset <= slice_end {
+                        retries += 1;
+                        if retries > MAX_CHUNK_RETRIES {
+                            return Err("Audio stream timed out".into());
+                        }
+                        thread::sleep(Duration::from_millis(400));
+                    }
+                }
+                Err(e) => {
+                    retries += 1;
+                    if retries > MAX_CHUNK_RETRIES {
+                        return Err(e);
+                    }
+                    thread::sleep(Duration::from_millis(400));
+                }
+            }
+        }
+        return Ok(());
     }
-    seg.chunks[chunk_id].status = ChunkStatus::Completed;
-    seg.chunks[chunk_id].speed_bps = 0;
+
+    let mut resp = open_range_stream(url, None, referer)?;
+    loop {
+        match resp.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out_file
+                .write_all(&buf[..n])
+                .map_err(|e| format!("Audio write error: {}", e))?,
+            Err(e) => return Err(format!("Audio read error: {}", e)),
+        }
+    }
+    Ok(())
 }
 
 pub fn unique_or_existing_path(dir: &PathBuf, filename: &str) -> PathBuf {

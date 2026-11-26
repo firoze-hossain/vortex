@@ -1,7 +1,57 @@
 //! vortex-core/src/media/sniffer.rs
 //! Intelligent Media Stream Sniffer & Video Format Detector (IDM-style).
 
+use std::sync::{Mutex, OnceLock};
+
 use serde::{Deserialize, Serialize};
+
+fn browser_stream_cache() -> &'static Mutex<Vec<(String, Vec<MediaStreamQuality>)>> {
+    static CACHE: OnceLock<Mutex<Vec<(String, Vec<MediaStreamQuality>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Records browser-authenticated streams received via `/api/sniff` so `+ Add URL` can unlock HD formats.
+pub fn record_browser_streams(page_url: &str, qualities: &[MediaStreamQuality]) {
+    if page_url.is_empty() || qualities.is_empty() {
+        return;
+    }
+    let Ok(mut cache) = browser_stream_cache().lock() else {
+        return;
+    };
+    if let Some((_, existing)) = cache.iter_mut().find(|(u, _)| u == page_url) {
+        for q in qualities {
+            if !existing.iter().any(|e| e.url == q.url) {
+                existing.push(q.clone());
+            }
+        }
+        return;
+    }
+    cache.push((page_url.to_string(), qualities.to_vec()));
+    if cache.len() > 30 {
+        cache.remove(0);
+    }
+}
+
+/// Returns any browser-captured streams matching `page_url` (or matching the same YouTube video ID).
+pub fn browser_streams_for_url(page_url: &str) -> Vec<MediaStreamQuality> {
+    let Ok(cache) = browser_stream_cache().lock() else {
+        return Vec::new();
+    };
+    let target_yt = extract_youtube_id(page_url);
+    let mut out = Vec::new();
+    for (stored_url, qs) in cache.iter().rev() {
+        let same_page = stored_url == page_url;
+        let same_yt = target_yt.is_some() && extract_youtube_id(stored_url) == target_yt;
+        if same_page || same_yt {
+            for q in qs {
+                if !out.iter().any(|e: &MediaStreamQuality| e.url == q.url) {
+                    out.push(q.clone());
+                }
+            }
+        }
+    }
+    out
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MediaStreamQuality {
@@ -16,6 +66,8 @@ pub struct MediaStreamQuality {
     pub is_hls: bool,
     #[serde(default)]
     pub has_audio: bool,
+    #[serde(default)]
+    pub audio_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -80,11 +132,12 @@ impl MediaSniffer {
             id,
             page_url: page_url.to_string(),
             title: title.to_string(),
-            qualities,
+            qualities: qualities.clone(),
             thumbnail_url,
             source_domain: extract_domain(page_url),
             detected_timestamp: now,
         };
+        record_browser_streams(page_url, &qualities);
         self.sniffed_items.push(media);
         self.sniffed_items.last().unwrap()
     }
@@ -116,6 +169,7 @@ impl MediaSniffer {
                 is_audio_only: false,
                 is_hls: false,
                 has_audio: true,
+                audio_url: None,
             }];
             return Some(self.register_media(page_url, &title, thumb, q));
         }
@@ -141,6 +195,7 @@ impl MediaSniffer {
                 is_audio_only: false,
                 is_hls,
                 has_audio: true,
+                audio_url: None,
             }];
             let id = self.next_id;
             self.next_id += 1;

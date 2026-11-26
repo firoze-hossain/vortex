@@ -59,6 +59,8 @@ struct StreamDownloadRequest {
     is_hls: bool,
     #[serde(default)]
     referer: Option<String>,
+    #[serde(default)]
+    audio_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -272,7 +274,21 @@ fn handle_client(mut stream: TcpStream, engine: Arc<Mutex<VortexEngine>>) {
                 req.quality
             };
 
-            match eng.start_real_stream(
+            let mut companion_audio = req.audio_url.clone();
+            if companion_audio.is_none() && !req.is_hls {
+                if let Some(ref ref_url) = req.referer {
+                    companion_audio = crate::media::sniffer::browser_streams_for_url(ref_url)
+                        .into_iter()
+                        .find(|q| {
+                            q.is_audio_only
+                                && !q.is_hls
+                                && (q.mime_type.contains("m4a") || q.mime_type.contains("mp4"))
+                        })
+                        .map(|q| q.url);
+                }
+            }
+
+            match eng.start_real_stream_with_audio(
                 &raw_name,
                 &req.url,
                 &res_lbl,
@@ -281,6 +297,7 @@ fn handle_client(mut stream: TcpStream, engine: Arc<Mutex<VortexEngine>>) {
                 req.is_hls,
                 req.referer,
                 None,
+                companion_audio,
             ) {
                 Ok(id) => {
                     let json = serde_json::json!({ "ok": true, "id": id, "filename": raw_name });

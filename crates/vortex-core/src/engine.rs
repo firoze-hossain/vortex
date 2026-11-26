@@ -101,6 +101,7 @@ pub struct StreamTask {
     pub segmented: SegmentedDownload,
     pub save_path: PathBuf,
     pub error_msg: Option<String>,
+    pub audio_url: Option<String>,
 }
 
 impl StreamTask {
@@ -298,6 +299,7 @@ impl VortexEngine {
                 segmented: seg,
                 save_path: rec.save_path.clone(),
                 error_msg: None,
+                audio_url: rec.audio_url.clone(),
             }));
 
             if !rec.completed && !rec.paused {
@@ -318,7 +320,7 @@ impl VortexEngine {
                         false,
                     )
                 } else {
-                    StreamHandle::start_http(
+                    StreamHandle::start_http_with_audio(
                         rec.id,
                         rec.url,
                         filename,
@@ -326,6 +328,7 @@ impl VortexEngine {
                         rec.threads,
                         save_dir,
                         None,
+                        rec.audio_url,
                         Arc::clone(&self.dl_limit_atomic),
                         false,
                     )
@@ -413,6 +416,7 @@ impl VortexEngine {
                         paused: s.status == TaskStatus::Paused,
                         completed: s.status == TaskStatus::Completed,
                         save_path: s.save_path.clone(),
+                        audio_url: s.audio_url.clone(),
                     });
                 }
                 DownloadTask::Torrent(t) => {
@@ -601,6 +605,7 @@ impl VortexEngine {
             segmented,
             save_path,
             error_msg: None,
+            audio_url: None,
         };
 
         self.tasks.push(DownloadTask::Stream(task));
@@ -618,6 +623,32 @@ impl VortexEngine {
         is_hls: bool,
         referer: Option<String>,
         save_dir: Option<PathBuf>,
+    ) -> Result<u64, String> {
+        self.start_real_stream_with_audio(
+            filename,
+            url,
+            resolution,
+            known_size,
+            num_threads,
+            is_hls,
+            referer,
+            save_dir,
+            None,
+        )
+    }
+
+    /// Starts a REAL multi-threaded HTTP/HTTPS or HLS stream download, optionally muxing companion audio.
+    pub fn start_real_stream_with_audio(
+        &mut self,
+        filename: &str,
+        url: &str,
+        resolution: &str,
+        known_size: u64,
+        num_threads: usize,
+        is_hls: bool,
+        referer: Option<String>,
+        save_dir: Option<PathBuf>,
+        audio_url: Option<String>,
     ) -> Result<u64, String> {
         let id = self.next_task_id;
         self.next_task_id += 1;
@@ -637,7 +668,7 @@ impl VortexEngine {
                 false,
             )?
         } else {
-            StreamHandle::start_http(
+            StreamHandle::start_http_with_audio(
                 id,
                 url.to_string(),
                 filename.to_string(),
@@ -645,6 +676,7 @@ impl VortexEngine {
                 threads,
                 dir,
                 referer,
+                audio_url.clone(),
                 Arc::clone(&self.dl_limit_atomic),
                 false,
             )?
@@ -667,6 +699,7 @@ impl VortexEngine {
             segmented: snap.segmented,
             save_path: snap.save_path,
             error_msg: snap.error_msg,
+            audio_url,
         };
 
         self.tasks.push(DownloadTask::Stream(task));
@@ -692,6 +725,16 @@ impl VortexEngine {
     }
 
     pub fn resume_task(&mut self, id: u64) {
+        let is_errored = self
+            .tasks
+            .iter()
+            .find(|t| t.id() == id)
+            .is_some_and(|t| t.status() == TaskStatus::Error);
+        if is_errored {
+            self.stream_workers.remove(&id);
+            self.swarm_workers.remove(&id);
+        }
+
         if let Some(h) = self.stream_workers.get(&id) {
             h.set_paused(false);
         }
@@ -721,7 +764,7 @@ impl VortexEngine {
                                 false,
                             )
                         } else {
-                            StreamHandle::start_http(
+                            StreamHandle::start_http_with_audio(
                                 st.id,
                                 st.url,
                                 st.name,
@@ -729,6 +772,7 @@ impl VortexEngine {
                                 st.active_threads,
                                 dir,
                                 None,
+                                st.audio_url,
                                 Arc::clone(&self.dl_limit_atomic),
                                 false,
                             )

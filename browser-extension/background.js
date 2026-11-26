@@ -6,12 +6,13 @@ const MAX_STREAMS_PER_TAB = 20;
 
 // In-memory store of media streams intercepted per tabId
 const tabStreams = new Map();
+const sniffSyncTimers = new Map();
 
 function cleanMediaUrl(rawUrl) {
   try {
     const u = new URL(rawUrl);
     // YouTube/Googlevideo requests include byte-range query params for MSE buffering.
-    // Removing range/rn/rbuf lets Vortex request the full stream cleanly.
+    // Removing range/rn/rbuf lets Vortex request the full stream while keeping the browser PO-Token (`pot=`).
     if (u.hostname.includes("googlevideo.com") && u.pathname.includes("videoplayback")) {
       u.searchParams.delete("range");
       u.searchParams.delete("rn");
@@ -25,28 +26,33 @@ function cleanMediaUrl(rawUrl) {
   }
 }
 
-function labelForYouTubeItag(itag, mime) {
-  const map = {
-    "18": "360p MP4 (Video+Audio)",
-    "22": "720p MP4 (Video+Audio)",
-    "37": "1080p MP4 (Video+Audio)",
-    "137": "1080p MP4 (Video)",
-    "299": "1080p 60fps MP4",
-    "136": "720p MP4 (Video)",
-    "298": "720p 60fps MP4",
-    "135": "480p MP4 (Video)",
-    "134": "360p MP4 (Video)",
-    "248": "1080p WebM",
-    "247": "720p WebM",
-    "313": "4K 2160p WebM",
-    "401": "4K 2160p AV1",
-    "140": "Audio M4A (128k)",
-    "251": "Audio Opus (160k)"
+function youtubeMetaForItag(itag, mime) {
+  const table = {
+    "18": { label: "360p MP4 (Video+Audio)", res: [640, 360], hasAudio: true },
+    "22": { label: "720p MP4 (Video+Audio)", res: [1280, 720], hasAudio: true },
+    "37": { label: "1080p MP4 (Video+Audio)", res: [1920, 1080], hasAudio: true },
+    "137": { label: "1080p MP4 (HD Video)", res: [1920, 1080], hasAudio: false },
+    "299": { label: "1080p 60fps MP4", res: [1920, 1080], hasAudio: false },
+    "399": { label: "1080p AV1 Video", res: [1920, 1080], hasAudio: false },
+    "136": { label: "720p MP4 (HD Video)", res: [1280, 720], hasAudio: false },
+    "298": { label: "720p 60fps MP4", res: [1280, 720], hasAudio: false },
+    "135": { label: "480p MP4 (Video)", res: [854, 480], hasAudio: false },
+    "134": { label: "360p MP4 (Video)", res: [640, 360], hasAudio: false },
+    "248": { label: "1080p WebM (HD)", res: [1920, 1080], hasAudio: false },
+    "247": { label: "720p WebM (HD)", res: [1280, 720], hasAudio: false },
+    "271": { label: "1440p QHD WebM", res: [2560, 1440], hasAudio: false },
+    "308": { label: "1440p 60fps WebM", res: [2560, 1440], hasAudio: false },
+    "400": { label: "1440p AV1", res: [2560, 1440], hasAudio: false },
+    "313": { label: "4K 2160p WebM", res: [3840, 2160], hasAudio: false },
+    "315": { label: "4K 2160p 60fps WebM", res: [3840, 2160], hasAudio: false },
+    "401": { label: "4K 2160p AV1", res: [3840, 2160], hasAudio: false },
+    "140": { label: "Audio M4A (128k)", res: [0, 0], hasAudio: true },
+    "251": { label: "Audio Opus (160k)", res: [0, 0], hasAudio: true }
   };
-  if (itag && map[itag]) return map[itag];
-  if (mime.includes("audio")) return itag ? `Audio (${itag})` : "Audio Stream";
-  if (mime.includes("webm")) return itag ? `WebM (${itag})` : "WebM Video";
-  return itag ? `MP4 (${itag})` : "Video Stream";
+  if (itag && table[itag]) return table[itag];
+  if (mime.includes("audio")) return { label: itag ? `Audio (${itag})` : "Audio Stream", res: [0, 0], hasAudio: true };
+  if (mime.includes("webm")) return { label: itag ? `WebM (${itag})` : "WebM Video", res: [1280, 720], hasAudio: false };
+  return { label: itag ? `MP4 (${itag})` : "Video Stream", res: [1280, 720], hasAudio: false };
 }
 
 function classifyMediaRequest(url, contentType, contentLength) {
@@ -76,6 +82,9 @@ function classifyMediaRequest(url, contentType, contentLength) {
   }
 
   let label = "Video Stream";
+  let res = [0, 0];
+  let hasAudio = true;
+  let totalSize = contentLength;
   let isAudioOnly = isAudioCt || isAudioExt;
   let mime = contentType || (isHls ? "application/x-mpegURL" : "video/mp4");
 
@@ -88,9 +97,14 @@ function classifyMediaRequest(url, contentType, contentLength) {
       const u = new URL(url);
       const itag = u.searchParams.get("itag") || "";
       const qMime = u.searchParams.get("mime") || mime;
-      mime = qMime;
+      const clen = parseInt(u.searchParams.get("clen") || "0", 10) || 0;
+      if (clen > 0) totalSize = clen;
+      mime = qMime.split(";")[0];
       isAudioOnly = qMime.includes("audio");
-      label = labelForYouTubeItag(itag, qMime);
+      const meta = youtubeMetaForItag(itag, qMime);
+      label = meta.label;
+      res = meta.res;
+      hasAudio = meta.hasAudio;
     } catch {
       label = "YouTube Media";
     }
@@ -106,12 +120,47 @@ function classifyMediaRequest(url, contentType, contentLength) {
     url: cleanMediaUrl(url),
     rawUrl: url,
     label,
+    res,
+    hasAudio,
     mime,
-    size: contentLength,
+    size: totalSize,
     isHls,
     isAudioOnly,
     timestamp: Date.now()
   };
+}
+
+function scheduleBridgeSniffSync(tabId) {
+  if (sniffSyncTimers.has(tabId)) return;
+  const timer = setTimeout(() => {
+    sniffSyncTimers.delete(tabId);
+    const streams = tabStreams.get(tabId);
+    if (!streams || streams.length === 0) return;
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError || !tab || !tab.url || !tab.url.startsWith("http")) return;
+      const payload = {
+        page_url: tab.url,
+        title: tab.title || "Browser Video",
+        thumbnail_url: null,
+        qualities: streams.slice(0, 12).map((s) => ({
+          label: `${s.label} [Browser Auth]`,
+          resolution: s.res || [0, 0],
+          mime_type: s.mime || "video/mp4",
+          estimated_size_bytes: s.size || 0,
+          url: s.url,
+          bitrate_kbps: 0,
+          is_audio_only: Boolean(s.isAudioOnly),
+          is_hls: Boolean(s.isHls),
+          has_audio: s.hasAudio !== undefined ? Boolean(s.hasAudio) : true
+        }))
+      };
+      bridgeFetch("/api/sniff", {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }).catch(() => {});
+    });
+  }, 700);
+  sniffSyncTimers.set(tabId, timer);
 }
 
 function recordTabStream(tabId, info) {
@@ -123,12 +172,15 @@ function recordTabStream(tabId, info) {
     list[existingIdx] = { ...list[existingIdx], ...info };
   } else {
     list.unshift(info);
+    // Sort higher resolutions first in list
+    list.sort((a, b) => ((b.res?.[1] || 0) - (a.res?.[1] || 0)));
     if (list.length > MAX_STREAMS_PER_TAB) {
       list.length = MAX_STREAMS_PER_TAB;
     }
   }
   tabStreams.set(tabId, list);
   updateActionBadge(tabId, list.length);
+  scheduleBridgeSniffSync(tabId);
 }
 
 function updateActionBadge(tabId, count) {
@@ -246,7 +298,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             size: msg.size || 0,
             threads: msg.threads || 8,
             is_hls: Boolean(msg.isHls),
-            referer: msg.referer || null
+            referer: msg.referer || null,
+            audio_url: msg.audioUrl || null
           })
         });
         sendResponse({ ok: true, data });
