@@ -1,0 +1,56 @@
+{
+  "manifest_version": 3,
+  "name": "Vortex Studio — IDM Video & Torrent Downloader",
+  "version": "2.0.0",
+  "description": "IDM-style floating video download bar for Firefox. Captures YouTube, HTML5, and HLS streams and sends them to Vortex Studio (127.0.0.1:47391).",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "vortex-idm@novaos.org",
+      "strict_min_version": "109.0"
+    }
+  },
+  "permissions": [
+    "webRequest",
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:47391/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Vortex Studio Downloader",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

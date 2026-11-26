@@ -52,7 +52,7 @@ cat << 'EOF' > "$NOVAOS_ROOT/tools/fixtures/VORTEX.PKG"
 [package]
 id = "org.novaos.vortex"
 name = "Vortex Studio"
-version = "1.0.0"
+version = "2.0.0"
 category = "Internet"
 app_filename = "VORTEX.ELF"
 summary = "BitTorrent client & IDM stream download accelerator"

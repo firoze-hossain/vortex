@@ -1,9 +1,10 @@
 [package]
 name = "vortex-ui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Vortex UI Component Library and Visualizer Widgets in Pure Rust"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 vortex-core = { path = "../vortex-core" }
+miniz_oxide = "0.9.1"
